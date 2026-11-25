@@ -120,7 +120,10 @@ class Asteroid {
 
 // ── Ship ──────────────────────────────────────────────────────────────────────
 class Ship {
-  constructor() { this.reset(); }
+  constructor() {
+    this.tripleShot = 0;   // segundos restantes de disparo triple (sobrevive a cambios de nivel)
+    this.reset();
+  }
 
   reset() {
     this.x      = W / 2;
@@ -139,6 +142,7 @@ class Ship {
     if (this.dead) return;
     if (this.invincible    > 0) this.invincible    -= dt;
     if (this.shootCooldown > 0) this.shootCooldown -= dt;
+    if (this.tripleShot    > 0) this.tripleShot    -= dt;
 
     const ROT   = 3.5;   // rad/s
     const THRUST = 260;  // px/s²
@@ -165,6 +169,11 @@ class Ship {
     const NOSE = 21;
     const ox = this.x + Math.cos(this.angle) * NOSE;
     const oy = this.y + Math.sin(this.angle) * NOSE;
+    if (this.tripleShot > 0) {
+      return [-TRIPLE_SPREAD, 0, TRIPLE_SPREAD].map(
+        off => new Bullet(ox, oy, this.angle + off)
+      );
+    }
     return [new Bullet(ox, oy, this.angle)];
   }
 
@@ -235,11 +244,66 @@ class Particle {
   }
 }
 
+// ── Power-up: disparo triple ──────────────────────────────────────────────────
+const POWERUP_TTL     = 10;    // segundos que permanece en pantalla sin recoger
+const TRIPLE_DURATION = 10;    // segundos que dura el disparo triple
+const TRIPLE_SPREAD   = 0.22;  // separación angular (rad) entre balas del abanico
+
+class PowerUp {
+  constructor(x, y) {
+    this.x = x;
+    this.y = y;
+    const angle = rand(0, Math.PI * 2);
+    const speed = rand(20, 40);
+    this.vx = Math.cos(angle) * speed;
+    this.vy = Math.sin(angle) * speed;
+    this.radius = 11;
+    this.ttl  = POWERUP_TTL;
+    this.t    = 0;
+    this.dead = false;
+  }
+
+  update(dt) {
+    this.x = wrap(this.x + this.vx * dt, W);
+    this.y = wrap(this.y + this.vy * dt, H);
+    this.t   += dt;
+    this.ttl -= dt;
+    if (this.ttl <= 0) this.dead = true;
+  }
+
+  draw() {
+    // Parpadea durante los últimos 3 segundos antes de desaparecer
+    if (this.ttl < 3 && Math.floor(this.ttl * 6) % 2 === 0) return;
+
+    const pulse = 1 + Math.sin(this.t * 6) * 0.12;
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.strokeStyle = '#4df';
+    ctx.lineWidth   = 1.5;
+    ctx.beginPath();
+    ctx.arc(0, 0, this.radius * pulse, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Icono: tres líneas en abanico apuntando hacia arriba
+    ctx.rotate(-Math.PI / 2);
+    for (const off of [-0.5, 0, 0.5]) {
+      ctx.beginPath();
+      ctx.moveTo(-4, 0);
+      ctx.lineTo(-4 + Math.cos(off) * 10, Math.sin(off) * 10);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+}
+
 // ── Estado del juego ──────────────────────────────────────────────────────────
-let ship, bullets, asteroids, particles;
+let ship, bullets, asteroids, particles, powerUps;
 let score, lives, level;
 let state;      // 'playing' | 'dead' | 'gameover'
 let deadTimer;
+let destroyedCount;  // asteroides destruidos en la partida
+let powerUpAt;       // nº de asteroide destruido que suelta el power-up (aleatorio)
+let powerUpSpawned;  // el power-up ya apareció en esta partida
 
 function spawnAsteroids(count) {
   const SAFE_DIST = 130;
@@ -258,10 +322,16 @@ function initGame() {
   bullets   = [];
   asteroids = [];
   particles = [];
+  powerUps  = [];
   score  = 0;
   lives  = 3;
   level  = 1;
   state  = 'playing';
+  destroyedCount = 0;
+  // El nivel 1 tiene 4 asteroides grandes = 28 destrucciones en total,
+  // así que elegir entre 3 y 20 garantiza que el power-up aparezca una vez.
+  powerUpAt      = randInt(3, 20);
+  powerUpSpawned = false;
   spawnAsteroids(4);
 }
 
@@ -280,6 +350,7 @@ function explode(x, y, count = 8) {
 function killShip() {
   explode(ship.x, ship.y, 14);
   ship.dead = true;
+  ship.tripleShot = 0;
   lives--;
   if (lives <= 0) {
     state = 'gameover';
@@ -303,6 +374,8 @@ function update(dt) {
     particles.forEach(p => p.update(dt));
     particles = particles.filter(p => !p.dead);
     asteroids.forEach(a => a.update(dt));
+    powerUps.forEach(p => p.update(dt));
+    powerUps = powerUps.filter(p => !p.dead);
     if (deadTimer <= 0) { state = 'playing'; ship.reset(); }
     return;
   }
@@ -316,6 +389,7 @@ function update(dt) {
   bullets.forEach(b => b.update(dt));
   asteroids.forEach(a => a.update(dt));
   particles.forEach(p => p.update(dt));
+  powerUps.forEach(p => p.update(dt));
 
   bullets   = bullets.filter(b => !b.dead);
   particles = particles.filter(p => !p.dead);
@@ -330,11 +404,26 @@ function update(dt) {
         score += POINTS[a.size];
         explode(a.x, a.y, a.size * 5);
         newAsteroids.push(...a.split());
+        destroyedCount++;
+        if (!powerUpSpawned && destroyedCount >= powerUpAt) {
+          powerUps.push(new PowerUp(a.x, a.y));
+          powerUpSpawned = true;
+        }
       }
     }
   }
   asteroids = asteroids.filter(a => !a.dead).concat(newAsteroids);
   bullets   = bullets.filter(b => !b.dead);
+
+  // Nave vs power-up
+  for (const p of powerUps) {
+    if (!p.dead && dist(ship, p) < ship.radius + p.radius) {
+      p.dead = true;
+      ship.tripleShot = TRIPLE_DURATION;
+      explode(p.x, p.y, 10);
+    }
+  }
+  powerUps = powerUps.filter(p => !p.dead);
 
   // Nave vs asteroide
   if (ship.invincible <= 0) {
@@ -381,6 +470,11 @@ function drawHUD() {
   for (let i = 0; i < lives; i++)
     drawLifeIcon(W - 16 - i * 22, 18);
 
+  if (ship.tripleShot > 0) {
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#4df';
+    ctx.fillText(`TRIPLE ${Math.ceil(ship.tripleShot)}s`, 14, 48);
+  }
 }
 
 function drawOverlay(title, sub) {
@@ -399,6 +493,7 @@ function draw() {
 
   particles.forEach(p => p.draw());
   asteroids.forEach(a => a.draw());
+  powerUps.forEach(p => p.draw());
   bullets.forEach(b => b.draw());
   ship.draw();
 
